@@ -1,0 +1,29 @@
+services:
+  sam3:
+    build:
+      context: .
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-sam3-base:torch2.11-cu128}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+    image: sam3-api:latest
+    container_name: sam3-api
+    restart: unless-stopped
+    ports:
+      - "${SAM3_PORT:-32100}:8000"
+    environment:
+      SAM3_MODEL_PATH: /models/sam3.1
+    volumes:
+      - ${SAM3_MODEL_DIR:-/data/models/sam3.1}:/models/sam3.1:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 180s
+      retries: 3
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
