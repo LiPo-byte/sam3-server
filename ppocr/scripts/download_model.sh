@@ -18,7 +18,9 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     exit 1
 fi
 
-docker run --rm -i \
+# paddlepaddle-gpu imports libcuda.so.1 even when device=cpu.
+# That library is only mounted when the NVIDIA runtime is enabled.
+docker run --rm -i --gpus all \
     -e PADDLE_PDX_MODEL_SOURCE="$PADDLE_PDX_MODEL_SOURCE" \
     -e PADDLE_PDX_CACHE_HOME=/cache \
     -e DOWNLOAD_PREPROCESS="$DOWNLOAD_PREPROCESS" \
