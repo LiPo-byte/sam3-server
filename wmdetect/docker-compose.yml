@@ -1,0 +1,29 @@
+services:
+  wmdetect:
+    build:
+      context: .
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-sam3-base:torch2.11-cu128}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+    image: wmdetect-api:latest
+    container_name: wmdetect-api
+    restart: unless-stopped
+    ports:
+      - "${WM_PORT:-32102}:8000"
+    environment:
+      WM_MODEL_PATH: /models/convnext-tiny_watermarks_detector.pth
+    volumes:
+      - ${WM_MODEL_DIR:-/data/models/watermark}:/models:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
