@@ -190,8 +190,9 @@ STAGE_OF_PROMPT = {
 }
 STAGE_ORDER = ["face", "hair", "person", "other", "background"]
 VALLEY_STAGES = {"person"}
-# other/background：按空间分片排序，不把路径换到别的组
-SPATIAL_STAGES = {"other", "background"}
+# other/background 先不走空间分片，只按 STAGE_ORDER 出（other 在 background 前）。
+# 要恢复空间分片时把这两个阶段加回来：{"other", "background"}
+SPATIAL_STAGES: set[str] = set()
 _PATH_NUM = re.compile(r"[-+]?(?:\d*\.\d+|\d+\.?\d*)(?:[eE][-+]?\d+)?")
 # 成对五官：左右眼 / 左右眉先按更松的阈值自己合并，不和对方部位绑在一起
 PAIR_COLOR_PROMPTS = frozenset({"eyes", "eyebrows"})

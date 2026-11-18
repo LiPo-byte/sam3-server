@@ -1,0 +1,30 @@
+services:
+  ppocr:
+    build:
+      context: .
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+        PADDLE_INDEX_URL: ${PADDLE_INDEX_URL:-https://www.paddlepaddle.org.cn/packages/stable/cu126/}
+    image: ppocr-api:latest
+    container_name: ppocr-api
+    restart: unless-stopped
+    ports:
+      - "${PPOCR_PORT:-32101}:8000"
+    environment:
+      PPOCR_MODEL_DIR: /models/ppocrv6
+      PPOCR_DEVICE: ${PPOCR_DEVICE:-gpu:0}
+    volumes:
+      - ${PPOCR_MODEL_DIR:-/data/models/ppocrv6}:/models/ppocrv6:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 180s
+      retries: 3
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
