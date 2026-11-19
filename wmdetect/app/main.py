@@ -40,6 +40,14 @@ class DetectRequest(BaseModel):
     image: str = Field(..., description="base64 encoded image, data URL prefix is allowed")
 
 
+class CornerResult(BaseModel):
+    corner: str
+    box: list[int]
+    watermarked: bool
+    label: int
+    score: float
+
+
 class DetectResponse(BaseModel):
     width: int
     height: int
@@ -47,6 +55,25 @@ class DetectResponse(BaseModel):
     watermarked: bool
     label: int
     score: float
+    corners: list[CornerResult]
+
+
+def _corner_boxes(width: int, height: int) -> dict[str, tuple[int, int, int, int]]:
+    """Square crops of the four corners. Side is 20% of the short side.
+
+    A 2048 image yields about 410px, a 2800 image about 560px. The detector
+    then resizes each crop to 256, so a small corner mark stays large enough
+    to see. Full-image resize would shrink that mark to a few pixels.
+    """
+    ratio = float(os.environ.get("WM_CORNER_RATIO", "0.2"))
+    side = max(1, int(round(min(width, height) * ratio)))
+    side = min(side, width, height)
+    return {
+        "tl": (0, 0, side, side),
+        "tr": (width - side, 0, width, side),
+        "bl": (0, height - side, side, height),
+        "br": (width - side, height - side, width, height),
+    }
 
 
 def _decode_image(data: str) -> Image.Image:
@@ -68,15 +95,28 @@ def health():
 def detect(req: DetectRequest):
     image = _decode_image(req.image)
     start = time.time()
-    label, score = state["model"].predict(image)
+    corners = []
+    for name, box in _corner_boxes(image.width, image.height).items():
+        label, score = state["model"].predict(image.crop(box))
+        corners.append(CornerResult(
+            corner=name,
+            box=list(box),
+            watermarked=bool(label),
+            label=label,
+            score=score,
+        ))
+    hits = [c for c in corners if c.watermarked]
+    chosen = max(hits or corners, key=lambda c: c.score)
     elapsed_ms = int((time.time() - start) * 1000)
-    logger.info("detect %dx%d watermarked=%s score=%.4f %dms",
-                image.width, image.height, bool(label), score, elapsed_ms)
+    logger.info("detect %dx%d watermarked=%s via %s score=%.4f corners=%s %dms",
+                image.width, image.height, bool(hits), chosen.corner, chosen.score,
+                ",".join(f"{c.corner}:{int(c.watermarked)}" for c in corners), elapsed_ms)
     return DetectResponse(
         width=image.width,
         height=image.height,
         elapsed_ms=elapsed_ms,
-        watermarked=bool(label),
-        label=label,
-        score=score,
+        watermarked=bool(hits),
+        label=1 if hits else 0,
+        score=chosen.score,
+        corners=corners,
     )
