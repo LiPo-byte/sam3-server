@@ -14,6 +14,8 @@ services:
       SAM3_MODEL_PATH: /models/sam3.1
     volumes:
       - ${SAM3_MODEL_DIR:-/data/models/sam3.1}:/models/sam3.1:ro
+    networks:
+      - gpu-net
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
       interval: 30s
@@ -27,3 +29,8 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+
+networks:
+  gpu-net:
+    name: gpu-net
+    external: true

@@ -1,0 +1,22 @@
+services:
+  gpu-worker:
+    build:
+      context: .
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+    image: gpu-worker:latest
+    container_name: gpu-worker
+    restart: unless-stopped
+    environment:
+      GPU_WORKER_WS_URL: ${GPU_WORKER_WS_URL:?需要 GPU_WORKER_WS_URL}
+      GPU_WORKER_TOKEN: ${GPU_WORKER_TOKEN:?需要 GPU_WORKER_TOKEN}
+      WATERMARK_URL: ${WATERMARK_URL-http://wmdetect-api:8000}
+      SAM3_URL: ${SAM3_URL-http://sam3-api:8000}
+    networks:
+      - gpu-net
+
+# 首次部署先执行 docker network create gpu-net；wmdetect、sam3 也挂在这个网络上
+networks:
+  gpu-net:
+    name: gpu-net
+    external: true
