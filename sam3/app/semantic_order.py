@@ -1,8 +1,9 @@
-"""语义排序：脸 → 头发 → 装饰 → 身体 → 穿戴 → 其它。
+"""语义排序：脸 → 头发 → 装饰 → 身体 → 穿戴 → 其它 → 背景。
 
 - 语义不同的区块即使同色也不进一组；身体（颈/肩/手臂…）先归一个桶，再按颜色弱合并
-- 身体/穿戴/其它合并时要求空间相邻，避免一组散在图的两头
+- 身体/穿戴/其它/背景合并时要求空间相邻，避免一组散在图的两头
 - 阶段内就近接力排序，下一阶段从离上一阶段末组最近的组开始
+- 其它/背景绕人物中心按扇区顺（逆）时针推进，同一扇区涂完再走下一个，不在角落留空缺
 
 与 /segment_order 完全独立，只共用模型和取色、栅格化工具。
 """
@@ -33,16 +34,20 @@ DEFAULT_STAGE_PROMPTS = {
     "hair": ["hair"],
     "apparel": ["shoe", "bag", "clothing"],
     "body": ["person"],
+    "background": ["background"],
 }
-ASSIGN_ORDER = ["decor", "face", "hair", "apparel", "body"]
-STAGE_ORDER = ["face", "hair", "decor", "body", "apparel", "other"]
+ASSIGN_ORDER = ["decor", "face", "hair", "apparel", "body", "background"]
+STAGE_ORDER = ["face", "hair", "decor", "body", "apparel", "other", "background"]
+PERSON_STAGES = frozenset({"face", "hair", "decor", "body", "apparel"})
+# 这些阶段绕人物中心按扇区顺/逆时针推进，扇区内再就近接力
+SWEEP_STAGES = ("other", "background")
 # 脸部分桶：眼、眉各自成桶（左右成对用更松的阈值），鼻/嘴并入脸部肤色桶
 FACE_BUCKET = {"eyes": "eyes", "eyebrows": "eyebrows", "nose": "face", "mouth": "face", "face": "face"}
 PAIR_BUCKETS = frozenset({"eyes", "eyebrows"})
 # 这些阶段按细类分桶：帽子和耳环同色也不合并
 PER_LABEL_STAGES = frozenset({"decor", "apparel"})
 # 这些阶段合并要求空间相邻；脸/头发/装饰本身紧凑或天然成对（左右耳环），不加约束
-SPATIAL_MERGE_STAGES = frozenset({"body", "apparel", "other"})
+SPATIAL_MERGE_STAGES = frozenset({"body", "apparel", "other", "background"})
 
 
 class SemanticOrderSection(BaseModel):
@@ -74,7 +79,7 @@ class SemanticOrderRequest(BaseModel):
         0.8, ge=0, le=1, description="眼/眉桶的合并阈值，更松，左右眼、左右眉更容易并成一组")
     merge_gap_ratio: float = Field(
         0.02, ge=0, le=1,
-        description="身体/穿戴/其它：两组包围盒最近距离 <= 此比例×图对角线才允许合并；0 关闭空间约束")
+        description="身体/穿戴/其它/背景：两组包围盒最近距离 <= 此比例×图对角线才允许合并；0 关闭空间约束")
     order_tolerance_ratio: float = Field(
         0.01, ge=0, le=1,
         description="就近接力时，距离在最近者 + 此比例×图对角线以内的候选里挑面积最大的")
@@ -87,6 +92,14 @@ class SemanticOrderRequest(BaseModel):
         0.34, ge=0, le=1, description="主色邻域像素占比上限，与 impure_delta_e 同时满足才标不纯")
     decor_prompts: list[str] | None = Field(None, description="覆盖默认装饰 prompt，具体词放前面")
     apparel_prompts: list[str] | None = Field(None, description="覆盖默认穿戴 prompt，具体词放前面")
+    background_prompts: list[str] | None = Field(None, description="覆盖默认背景 prompt，如 ['sky','wall','floor','background']")
+    sweep_sectors: int = Field(
+        8, ge=0, le=72,
+        description="other/background 绕人物中心切成几个扇区，按扇区顺序推进，同扇区涂完再走下一个；0 关闭，退回整阶段就近接力")
+    sweep_clockwise: bool = Field(True, description="扇区推进方向，True 顺时针（屏幕坐标）")
+    sweep_joint: bool = Field(
+        False,
+        description="False：other 先转完一圈，background 再转一圈；True：每个扇区内先 other 再 background，一圈转完两者")
 
 
 class SemanticOrderGroupOut(BaseModel):
@@ -121,6 +134,7 @@ class _Group:
     label: str
     color: str
     members: list[_Sec] = field(default_factory=list)
+    sector: int = -1
 
     @property
     def area(self) -> int:
@@ -275,7 +289,7 @@ def _hex_to_lab(color: str) -> np.ndarray | None:
 
 def _merge_bucket(secs: list[_Sec], stage: str, label: str, *,
                   min_similarity: float, gap_px: float,
-                  large_area_px: float, block_impure: bool) -> list[_Group]:
+                  large_area_px: float, block_impure: bool, sector: int = -1) -> list[_Group]:
     """hex 全等先成组（有空间约束时按相邻拆成连通块），再贪心合并相近色，保留面积大那组的颜色。"""
     by_hex: dict[str, list[_Sec]] = defaultdict(list)
     for s in secs:
@@ -283,7 +297,7 @@ def _merge_bucket(secs: list[_Sec], stage: str, label: str, *,
     groups: list[_Group] = []
     for color, members in by_hex.items():
         comps = _connected(members, gap_px) if gap_px > 0 and len(members) > 1 else [members]
-        groups.extend(_Group(stage, label, color, comp) for comp in comps)
+        groups.extend(_Group(stage, label, color, comp, sector) for comp in comps)
 
     n = len(groups)
     if min_similarity >= 1 or n < 2:
@@ -339,6 +353,13 @@ def _pick(dist: np.ndarray, remaining: list[int], areas: np.ndarray, tol_px: flo
     return max(cands, key=lambda k: areas[k])
 
 
+def _gap_to_tail(tail: _Group, groups: list[_Group]) -> np.ndarray:
+    tail_boxes = np.stack([s.box for s in tail.members])
+    boxes = np.stack([s.box for g in groups for s in g.members])
+    starts = np.cumsum([0] + [len(g.members) for g in groups[:-1]])
+    return np.minimum.reduceat(_box_gap(tail_boxes, boxes).min(axis=0), starts)
+
+
 def _order_stage(groups: list[_Group], tail: _Group | None, tol_px: float) -> list[_Group]:
     """就近接力：起点是离上一阶段末组最近的组（第一阶段用最大组），之后每步接离当前组最近的。"""
     if len(groups) <= 1:
@@ -349,11 +370,7 @@ def _order_stage(groups: list[_Group], tail: _Group | None, tol_px: float) -> li
     if tail is None:
         cur = int(areas.argmax())
     else:
-        tail_boxes = np.stack([s.box for s in tail.members])
-        boxes = np.stack([s.box for g in groups for s in g.members])
-        starts = np.cumsum([0] + [len(g.members) for g in groups[:-1]])
-        to_tail = np.minimum.reduceat(_box_gap(tail_boxes, boxes).min(axis=0), starts)
-        cur = _pick(to_tail, remaining, areas, tol_px)
+        cur = _pick(_gap_to_tail(tail, groups), remaining, areas, tol_px)
     ordered = [cur]
     remaining.remove(cur)
     while remaining:
@@ -361,6 +378,52 @@ def _order_stage(groups: list[_Group], tail: _Group | None, tol_px: float) -> li
         ordered.append(cur)
         remaining.remove(cur)
     return [groups[k] for k in ordered]
+
+
+def _sec_center(sec: _Sec) -> tuple[float, float]:
+    if sec.xy:
+        return sec.xy
+    b = sec.box
+    return float(b[0] + b[2]) / 2, float(b[1] + b[3]) / 2
+
+
+def _subject_center(secs: list[_Sec], width: int, height: int) -> tuple[float, float]:
+    """人物各阶段区块按面积加权的中心；没有人物退回图片中心。"""
+    if not secs:
+        return width / 2, height / 2
+    pts = np.array([_sec_center(s) for s in secs], np.float64)
+    w = np.array([max(s.area, 1) for s in secs], np.float64)
+    c = (pts * w[:, None]).sum(axis=0) / w.sum()
+    return float(c[0]), float(c[1])
+
+
+def _sector_of(sec: _Sec, center: tuple[float, float], n: int) -> int:
+    # 屏幕坐标 y 向下，atan2 角度增大即视觉上的顺时针
+    x, y = _sec_center(sec)
+    angle = math.atan2(y - center[1], x - center[0]) % (2 * math.pi)
+    return int(angle / (2 * math.pi / n)) % n
+
+
+def _order_sweep(stage_groups: list[list[_Group]], tail: _Group | None, tol_px: float,
+                 n_sectors: int, clockwise: bool) -> list[_Group]:
+    """从离 tail 最近那组所在扇区开始，按方向逐个扇区推进；扇区内依 stage_groups 的阶段顺序就近接力。"""
+    everything = [g for groups in stage_groups for g in groups]
+    if not everything:
+        return []
+    if tail is None:
+        start = max(everything, key=lambda g: g.area).sector
+    else:
+        start = everything[int(_gap_to_tail(tail, everything).argmin())].sector
+    step = 1 if clockwise else -1
+    out: list[_Group] = []
+    for k in range(n_sectors):
+        sector = (start + step * k) % n_sectors
+        for groups in stage_groups:
+            ordered = _order_stage([g for g in groups if g.sector == sector], tail, tol_px)
+            out.extend(ordered)
+            if ordered:
+                tail = ordered[-1]
+    return out
 
 
 def build_router(get_model: Callable[[], object]) -> APIRouter:
@@ -379,6 +442,8 @@ def build_router(get_model: Callable[[], object]) -> APIRouter:
             stage_prompts["decor"] = [p.strip() for p in req.decor_prompts if p.strip()]
         if req.apparel_prompts:
             stage_prompts["apparel"] = [p.strip() for p in req.apparel_prompts if p.strip()]
+        if req.background_prompts:
+            stage_prompts["background"] = [p.strip() for p in req.background_prompts if p.strip()]
         prompts = list(dict.fromkeys(p for stage in ASSIGN_ORDER for p in stage_prompts[stage]))
 
         unions: dict[str, np.ndarray] = {}
@@ -387,41 +452,64 @@ def build_router(get_model: Callable[[], object]) -> APIRouter:
             m = mask > 0
             unions[prompt] = unions[prompt] | m if prompt in unions else m
 
-        buckets: dict[tuple[str, str], list[_Sec]] = defaultdict(list)
-        n_sections = 0
+        assigned: list[tuple[_Sec, str, str]] = []
         for group in req.group_list:
             for section in group.section_list:
-                n_sections += 1
                 sec = _prepare_section(image_np, section, req.impure_delta_e, req.impure_dominant_ratio)
                 stage, prompt, cov = _assign(sec, unions, stage_prompts, req.coverage_ratio)
                 sec.item["stage"] = stage
                 sec.item["semantic"] = prompt
                 sec.item["coverage"] = round(cov, 3)
-                buckets[(stage, _bucket_of(stage, prompt))].append(sec)
+                assigned.append((sec, stage, prompt))
+        n_sections = len(assigned)
+
+        sweep = req.sweep_sectors > 0
+        center = _subject_center([s for s, st, _ in assigned if st in PERSON_STAGES], width, height)
+        # 扇区进桶：other/background 不跨扇区合并，保证按扇区推进时同一组不会横跨两边
+        buckets: dict[tuple[str, str, int], list[_Sec]] = defaultdict(list)
+        for sec, stage, prompt in assigned:
+            sector = _sector_of(sec, center, req.sweep_sectors) if sweep and stage in SWEEP_STAGES else -1
+            if sector >= 0:
+                sec.item["sector"] = sector
+            buckets[(stage, _bucket_of(stage, prompt), sector)].append(sec)
 
         large_area_px = width * height * req.large_area_ratio
         by_stage: dict[str, list[_Group]] = defaultdict(list)
-        for (stage, label), secs in buckets.items():
+        for (stage, label, sector), secs in buckets.items():
             pair = label in PAIR_BUCKETS
             by_stage[stage].extend(_merge_bucket(
                 secs, stage, label,
                 min_similarity=req.pair_color_similarity if pair else req.color_similarity,
                 gap_px=req.merge_gap_ratio * diag if stage in SPATIAL_MERGE_STAGES else 0,
                 large_area_px=large_area_px,
-                block_impure=not pair))
+                block_impure=not pair,
+                sector=sector))
 
-        results = [SemanticOrderGroupOut(id=req.group_list[0].id, delegate_color="", section_list=[])]
         tail = None
         tol_px = req.order_tolerance_ratio * diag
+        ordered_all: list[_Group] = []
         for stage in STAGE_ORDER:
+            if sweep and stage in SWEEP_STAGES:
+                continue
             ordered = _order_stage(by_stage[stage], tail, tol_px)
-            for g in ordered:
-                g.members.sort(key=lambda s: s.area, reverse=True)
-                results.append(SemanticOrderGroupOut(
-                    prompt=g.stage, label=g.label, delegate_color=g.color,
-                    section_list=[s.item for s in g.members]))
+            ordered_all.extend(ordered)
             if ordered:
                 tail = ordered[-1]
+        if sweep:
+            passes = ([[by_stage[s] for s in SWEEP_STAGES]] if req.sweep_joint
+                      else [[by_stage[s]] for s in SWEEP_STAGES])
+            for stage_groups in passes:
+                ordered = _order_sweep(stage_groups, tail, tol_px, req.sweep_sectors, req.sweep_clockwise)
+                ordered_all.extend(ordered)
+                if ordered:
+                    tail = ordered[-1]
+
+        results = [SemanticOrderGroupOut(id=req.group_list[0].id, delegate_color="", section_list=[])]
+        for g in ordered_all:
+            g.members.sort(key=lambda s: s.area, reverse=True)
+            results.append(SemanticOrderGroupOut(
+                prompt=g.stage, label=g.label, delegate_color=g.color,
+                section_list=[s.item for s in g.members]))
 
         elapsed_ms = int((time.time() - start) * 1000)
         logger.info("segment_semantic_order %dx%d sections=%d groups=%d %dms",
