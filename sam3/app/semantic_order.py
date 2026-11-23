@@ -1,4 +1,4 @@
-"""语义排序：脸 → 头发 → 装饰 → 身体 → 穿戴 → 其它 → 背景。
+"""语义排序：头部（脸 → 头发 → 头部装饰）→ 身体（皮肤/其余装饰/穿戴从上到下）→ 其它 → 背景。
 
 - 语义不同的区块即使同色也不进一组；身体（颈/肩/手臂…）先归一个桶，再按颜色弱合并
 - 身体/穿戴/其它/背景合并时要求空间相邻，避免一组散在图的两头
@@ -27,22 +27,27 @@ from .svg_raster import rasterize_path
 
 logger = logging.getLogger("sam3")
 
-# 归类按 ASSIGN_ORDER 的阶段优先级；阶段内取列表里第一个覆盖率达标的 prompt，所以具体词放前面
+# 归类优先级：五官/耳朵 > 装饰 > 脸部皮肤 > 头发 > 穿戴 > 身体 > 背景（见 _assign_tiers）；
+# 同一档内取列表里第一个覆盖率达标的 prompt，所以具体词放前面
 DEFAULT_STAGE_PROMPTS = {
     "decor": ["hat", "headband", "glasses", "earring", "necklace", "jewelry"],
-    "face": ["eyes", "eyebrows", "nose", "mouth", "face"],
+    "face": ["eyes", "eyebrows", "nose", "mouth", "ear", "face"],
     "hair": ["hair"],
     "apparel": ["shoe", "bag", "clothing"],
     "body": ["person"],
     "background": ["background"],
 }
 ASSIGN_ORDER = ["decor", "face", "hair", "apparel", "body", "background"]
-STAGE_ORDER = ["face", "hair", "decor", "body", "apparel", "other", "background"]
+# 排序：头部（脸 → 头发 → 头部装饰）→ 身体（皮肤/其余装饰/穿戴混排，水平条带从上往下）→ other → background
+# 没识别到脸时，按细类判断哪些装饰属于头部
+HEAD_DECOR_LABELS = frozenset({"hat", "headband", "glasses", "earring"})
 PERSON_STAGES = frozenset({"face", "hair", "decor", "body", "apparel"})
 # 这些阶段绕人物中心按扇区顺/逆时针推进，扇区内再就近接力
 SWEEP_STAGES = ("other", "background")
-# 脸部分桶：眼、眉各自成桶（左右成对用更松的阈值），鼻/嘴并入脸部肤色桶
-FACE_BUCKET = {"eyes": "eyes", "eyebrows": "eyebrows", "nose": "face", "mouth": "face", "face": "face"}
+# 脸部皮肤：优先级低于装饰，否则压在脸上的眼镜、耳环会被归进脸
+FACE_SKIN_PROMPT = "face"
+# 脸部分桶：眼、眉各自成桶（左右成对用更松的阈值），鼻/嘴/耳并入脸部肤色桶
+FACE_BUCKET = {"eyes": "eyes", "eyebrows": "eyebrows", "nose": "face", "mouth": "face", "ear": "face", "face": "face"}
 PAIR_BUCKETS = frozenset({"eyes", "eyebrows"})
 # 这些阶段按细类分桶：帽子和耳环同色也不合并
 PER_LABEL_STAGES = frozenset({"decor", "apparel"})
@@ -93,6 +98,9 @@ class SemanticOrderRequest(BaseModel):
     decor_prompts: list[str] | None = Field(None, description="覆盖默认装饰 prompt，具体词放前面")
     apparel_prompts: list[str] | None = Field(None, description="覆盖默认穿戴 prompt，具体词放前面")
     background_prompts: list[str] | None = Field(None, description="覆盖默认背景 prompt，如 ['sky','wall','floor','background']")
+    body_band_ratio: float = Field(
+        0.12, ge=0, le=1,
+        description="身体阶段水平条带高度 = 身体阶段纵向范围 × 此值；组按顶边落入条带，条带从上往下、条带内就近接力；0 关闭条带")
     sweep_sectors: int = Field(
         8, ge=0, le=72,
         description="other/background 绕人物中心切成几个扇区，按扇区顺序推进，同扇区涂完再走下一个；0 关闭，退回整阶段就近接力")
@@ -218,17 +226,28 @@ def _coverage(sec: _Sec, mask: np.ndarray) -> float:
     return 0.0
 
 
-def _assign(sec: _Sec, unions: dict[str, np.ndarray],
-            stage_prompts: dict[str, list[str]], coverage_ratio: float) -> tuple[str, str, float]:
-    """返回 (stage, 细类 prompt, 覆盖率)；都不命中归 other。"""
+def _assign_tiers(stage_prompts: dict[str, list[str]]) -> list[tuple[str, str]]:
+    """按归类优先级展开成 (stage, prompt) 列表。"""
+    face = stage_prompts["face"]
+    tiers = [("face", p) for p in face if p != FACE_SKIN_PROMPT]
+    tiers += [("decor", p) for p in stage_prompts["decor"]]
+    tiers += [("face", p) for p in face if p == FACE_SKIN_PROMPT]
     for stage in ASSIGN_ORDER:
-        for prompt in stage_prompts[stage]:
-            mask = unions.get(prompt)
-            if mask is None:
-                continue
-            cov = _coverage(sec, mask)
-            if cov > 0 and cov >= coverage_ratio:
-                return stage, prompt, cov
+        if stage not in ("face", "decor"):
+            tiers += [(stage, p) for p in stage_prompts[stage]]
+    return tiers
+
+
+def _assign(sec: _Sec, unions: dict[str, np.ndarray],
+            tiers: list[tuple[str, str]], coverage_ratio: float) -> tuple[str, str, float]:
+    """返回 (stage, 细类 prompt, 覆盖率)；都不命中归 other。"""
+    for stage, prompt in tiers:
+        mask = unions.get(prompt)
+        if mask is None:
+            continue
+        cov = _coverage(sec, mask)
+        if cov > 0 and cov >= coverage_ratio:
+            return stage, prompt, cov
     return "other", "other", 0.0
 
 
@@ -347,10 +366,10 @@ def _merge_bucket(secs: list[_Sec], stage: str, label: str, *,
     return [g for k, g in enumerate(groups) if alive[k]]
 
 
-def _pick(dist: np.ndarray, remaining: list[int], areas: np.ndarray, tol_px: float) -> int:
+def _pick(dist: np.ndarray, remaining: list[int], tie: np.ndarray, tol_px: float) -> int:
     best = min(dist[k] for k in remaining)
     cands = [k for k in remaining if dist[k] <= best + tol_px]
-    return max(cands, key=lambda k: areas[k])
+    return max(cands, key=lambda k: tie[k])
 
 
 def _gap_to_tail(tail: _Group, groups: list[_Group]) -> np.ndarray:
@@ -360,24 +379,73 @@ def _gap_to_tail(tail: _Group, groups: list[_Group]) -> np.ndarray:
     return np.minimum.reduceat(_box_gap(tail_boxes, boxes).min(axis=0), starts)
 
 
-def _order_stage(groups: list[_Group], tail: _Group | None, tol_px: float) -> list[_Group]:
-    """就近接力：起点是离上一阶段末组最近的组（第一阶段用最大组），之后每步接离当前组最近的。"""
+def _order_stage(groups: list[_Group], tail: _Group | None, tol_px: float,
+                 start: int | None = None, prefer_top: bool = False) -> list[_Group]:
+    """就近接力：起点是 start，或离上一阶段末组最近的组（第一阶段用最大组），之后每步接离当前组最近的。
+
+    距离在容差内的候选默认取面积最大的；prefer_top 时取顶边最靠上的。
+    """
     if len(groups) <= 1:
         return list(groups)
     areas = np.array([g.area for g in groups], np.float64)
+    tie = -np.array([_group_top(g) for g in groups]) if prefer_top else areas
     gap = _group_gap_matrix(groups)
     remaining = list(range(len(groups)))
-    if tail is None:
+    if start is not None:
+        cur = start
+    elif tail is None:
         cur = int(areas.argmax())
     else:
-        cur = _pick(_gap_to_tail(tail, groups), remaining, areas, tol_px)
+        cur = _pick(_gap_to_tail(tail, groups), remaining, tie, tol_px)
     ordered = [cur]
     remaining.remove(cur)
     while remaining:
-        cur = _pick(gap[cur], remaining, areas, tol_px)
+        cur = _pick(gap[cur], remaining, tie, tol_px)
         ordered.append(cur)
         remaining.remove(cur)
     return [groups[k] for k in ordered]
+
+
+def _group_top(g: _Group) -> float:
+    return float(min(s.box[1] for s in g.members))
+
+
+def _split_head_decor(decor: list[_Group], face: list[_Group]) -> tuple[list[_Group], list[_Group]]:
+    """顶边高于脸部最下沿的装饰算头部（帽子、眼镜、耳环），其余（项链等）跟身体一起排。"""
+    if face:
+        face_bottom = max(float(s.box[3]) for g in face for s in g.members)
+        is_head = [_group_top(g) < face_bottom for g in decor]
+    else:
+        is_head = [g.label in HEAD_DECOR_LABELS for g in decor]
+    return ([g for g, h in zip(decor, is_head) if h],
+            [g for g, h in zip(decor, is_head) if not h])
+
+
+def _order_bands(groups: list[_Group], tail: _Group | None, tol_px: float, band_ratio: float) -> list[_Group]:
+    """按组顶边切成水平条带，条带从上往下；条带内从最靠上的组起步（并列时取离 tail 最近的），再就近接力。"""
+    if not groups:
+        return []
+    tops = np.array([_group_top(g) for g in groups])
+    bottom = max(float(s.box[3]) for g in groups for s in g.members)
+    band_px = (bottom - tops.min()) * band_ratio
+    if band_px <= 0:
+        return _order_stage(groups, tail, tol_px)
+    band_of = ((tops - tops.min()) // band_px).astype(int)
+    out: list[_Group] = []
+    for band in sorted(set(band_of.tolist())):
+        members = [g for g, b in zip(groups, band_of) if b == band]
+        member_tops = np.array([_group_top(g) for g in members])
+        topmost = [k for k in range(len(members)) if member_tops[k] <= member_tops.min() + tol_px]
+        if tail is not None and len(topmost) > 1:
+            to_tail = _gap_to_tail(tail, members)
+            start = min(topmost, key=lambda k: to_tail[k])
+        else:
+            start = topmost[0]
+        ordered = _order_stage(members, tail, tol_px, start=start, prefer_top=True)
+        out.extend(ordered)
+        if ordered:
+            tail = ordered[-1]
+    return out
 
 
 def _sec_center(sec: _Sec) -> tuple[float, float]:
@@ -444,7 +512,8 @@ def build_router(get_model: Callable[[], object]) -> APIRouter:
             stage_prompts["apparel"] = [p.strip() for p in req.apparel_prompts if p.strip()]
         if req.background_prompts:
             stage_prompts["background"] = [p.strip() for p in req.background_prompts if p.strip()]
-        prompts = list(dict.fromkeys(p for stage in ASSIGN_ORDER for p in stage_prompts[stage]))
+        tiers = _assign_tiers(stage_prompts)
+        prompts = list(dict.fromkeys(p for _, p in tiers))
 
         unions: dict[str, np.ndarray] = {}
         for prompt, _score, _box, mask in get_model().segment(
@@ -456,7 +525,7 @@ def build_router(get_model: Callable[[], object]) -> APIRouter:
         for group in req.group_list:
             for section in group.section_list:
                 sec = _prepare_section(image_np, section, req.impure_delta_e, req.impure_dominant_ratio)
-                stage, prompt, cov = _assign(sec, unions, stage_prompts, req.coverage_ratio)
+                stage, prompt, cov = _assign(sec, unions, tiers, req.coverage_ratio)
                 sec.item["stage"] = stage
                 sec.item["semantic"] = prompt
                 sec.item["coverage"] = round(cov, 3)
@@ -488,14 +557,24 @@ def build_router(get_model: Callable[[], object]) -> APIRouter:
         tail = None
         tol_px = req.order_tolerance_ratio * diag
         ordered_all: list[_Group] = []
-        for stage in STAGE_ORDER:
-            if sweep and stage in SWEEP_STAGES:
-                continue
-            ordered = _order_stage(by_stage[stage], tail, tol_px)
+        head_decor, body_decor = _split_head_decor(by_stage["decor"], by_stage["face"])
+        for groups in (by_stage["face"], by_stage["hair"], head_decor):
+            ordered = _order_stage(groups, tail, tol_px)
             ordered_all.extend(ordered)
             if ordered:
                 tail = ordered[-1]
-        if sweep:
+        ordered = _order_bands(by_stage["body"] + body_decor + by_stage["apparel"],
+                               tail, tol_px, req.body_band_ratio)
+        ordered_all.extend(ordered)
+        if ordered:
+            tail = ordered[-1]
+        if not sweep:
+            for stage in SWEEP_STAGES:
+                ordered = _order_stage(by_stage[stage], tail, tol_px)
+                ordered_all.extend(ordered)
+                if ordered:
+                    tail = ordered[-1]
+        else:
             passes = ([[by_stage[s] for s in SWEEP_STAGES]] if req.sweep_joint
                       else [[by_stage[s]] for s in SWEEP_STAGES])
             for stage_groups in passes:
