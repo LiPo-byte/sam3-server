@@ -17,6 +17,7 @@ from .model_handler import Sam3Segmenter
 from .color import _region_color_stats, _to_hex, _rgb_to_lab, _delta_e2000
 from .svg_path import mask_to_svg_path
 from .svg_raster import rasterize_path
+from .semantic_order import build_router as build_semantic_order_router
 from collections import defaultdict
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -40,6 +41,7 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+app.include_router(build_semantic_order_router(lambda: state["model"]))
 
 
 class SegmentRequest(BaseModel):
