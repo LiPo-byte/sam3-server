@@ -27,8 +27,8 @@ from .svg_raster import rasterize_path
 
 logger = logging.getLogger("sam3")
 
-# 归类优先级：五官/耳朵 > 装饰 > 脸部皮肤 > 头发 > 穿戴 > 身体 > 背景（见 _assign_tiers）；
-# 同一档内取列表里第一个覆盖率达标的 prompt，所以具体词放前面
+# 归类优先级：五官/耳朵 + 装饰 > 脸部皮肤 > 头发 > 穿戴 > 身体 > 背景（见 _assign_tiers）；
+# 五官/耳朵 + 装饰同一档取最佳匹配（眼睛常压在眼镜 mask 里，见 _assign），其余档取列表里第一个覆盖率达标的 prompt，所以具体词放前面
 DEFAULT_STAGE_PROMPTS = {
     "decor": ["hat", "headband", "glasses", "earring", "necklace", "jewelry"],
     "face": ["eyes", "eyebrows", "nose", "mouth", "ear", "face"],
@@ -77,6 +77,10 @@ class SemanticOrderRequest(BaseModel):
     coverage_ratio: float = Field(
         0.5, ge=0, le=1,
         description="区块落在某个 prompt mask 内的面积占比 >= 此值才算命中；路径栅格化失败时退回 label_pos 圆心判断")
+    nested_coverage_ratio: float = Field(
+        0.3, ge=0, le=1,
+        description="五官/装饰档已有 prompt 命中时，覆盖率 >= 此值的其它 prompt 也参与比较，取 mask 面积最小（最具体）的；"
+                    "用于眼睛落在眼镜 mask 里但 eyes mask 偏小的情况")
     color_similarity: float = Field(
         0.9, ge=0, le=1,
         description="同一桶内相近色合并阈值，1 - ΔE2000/100；0.9 约等于 ΔE<=10；1 表示只合并 hex 全等")
@@ -226,21 +230,31 @@ def _coverage(sec: _Sec, mask: np.ndarray) -> float:
     return 0.0
 
 
-def _assign_tiers(stage_prompts: dict[str, list[str]]) -> list[tuple[str, str]]:
-    """按归类优先级展开成 (stage, prompt) 列表。"""
+def _assign_tiers(stage_prompts: dict[str, list[str]]) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """按归类优先级展开成 (stage, prompt) 列表：(五官/耳朵 + 装饰, 其余按顺序)。"""
     face = stage_prompts["face"]
-    tiers = [("face", p) for p in face if p != FACE_SKIN_PROMPT]
-    tiers += [("decor", p) for p in stage_prompts["decor"]]
-    tiers += [("face", p) for p in face if p == FACE_SKIN_PROMPT]
+    specific = [("face", p) for p in face if p != FACE_SKIN_PROMPT]
+    specific += [("decor", p) for p in stage_prompts["decor"]]
+    tiers = [("face", p) for p in face if p == FACE_SKIN_PROMPT]
     for stage in ASSIGN_ORDER:
         if stage not in ("face", "decor"):
             tiers += [(stage, p) for p in stage_prompts[stage]]
-    return tiers
+    return specific, tiers
 
 
-def _assign(sec: _Sec, unions: dict[str, np.ndarray],
-            tiers: list[tuple[str, str]], coverage_ratio: float) -> tuple[str, str, float]:
-    """返回 (stage, 细类 prompt, 覆盖率)；都不命中归 other。"""
+def _assign(sec: _Sec, unions: dict[str, np.ndarray], mask_areas: dict[str, int],
+            specific: list[tuple[str, str]], tiers: list[tuple[str, str]],
+            coverage_ratio: float, nested_ratio: float) -> tuple[str, str, float]:
+    """返回 (stage, 细类 prompt, 覆盖率)；都不命中归 other。
+
+    五官/装饰档：有 prompt 达到 coverage_ratio 时，覆盖率 >= min(coverage_ratio, nested_ratio) 的候选里取 mask 最小的，
+    镜片里的眼睛同时被 eyes/glasses 覆盖时归眼睛，镜框只被 glasses 覆盖归眼镜。
+    """
+    covs = [(stage, prompt, _coverage(sec, unions[prompt])) for stage, prompt in specific if prompt in unions]
+    if any(c > 0 and c >= coverage_ratio for _, _, c in covs):
+        floor = min(coverage_ratio, nested_ratio)
+        cands = [x for x in covs if x[2] > 0 and x[2] >= floor]
+        return min(cands, key=lambda x: mask_areas[x[1]])
     for stage, prompt in tiers:
         mask = unions.get(prompt)
         if mask is None:
@@ -512,20 +526,22 @@ def build_router(get_model: Callable[[], object]) -> APIRouter:
             stage_prompts["apparel"] = [p.strip() for p in req.apparel_prompts if p.strip()]
         if req.background_prompts:
             stage_prompts["background"] = [p.strip() for p in req.background_prompts if p.strip()]
-        tiers = _assign_tiers(stage_prompts)
-        prompts = list(dict.fromkeys(p for _, p in tiers))
+        specific, tiers = _assign_tiers(stage_prompts)
+        prompts = list(dict.fromkeys(p for _, p in specific + tiers))
 
         unions: dict[str, np.ndarray] = {}
         for prompt, _score, _box, mask in get_model().segment(
                 image, prompts, req.threshold, req.mask_threshold):
             m = mask > 0
             unions[prompt] = unions[prompt] | m if prompt in unions else m
+        mask_areas = {p: int(m.sum()) for p, m in unions.items()}
 
         assigned: list[tuple[_Sec, str, str]] = []
         for group in req.group_list:
             for section in group.section_list:
                 sec = _prepare_section(image_np, section, req.impure_delta_e, req.impure_dominant_ratio)
-                stage, prompt, cov = _assign(sec, unions, tiers, req.coverage_ratio)
+                stage, prompt, cov = _assign(sec, unions, mask_areas, specific, tiers,
+                                             req.coverage_ratio, req.nested_coverage_ratio)
                 sec.item["stage"] = stage
                 sec.item["semantic"] = prompt
                 sec.item["coverage"] = round(cov, 3)
