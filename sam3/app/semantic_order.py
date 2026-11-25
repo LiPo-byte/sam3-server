@@ -15,7 +15,7 @@ import math
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Annotated, Callable
 
 import numpy as np
 from fastapi import APIRouter, HTTPException
@@ -88,6 +88,11 @@ class SemanticOrderRequest(BaseModel):
         description="同一桶内相近色合并阈值，1 - ΔE2000/100；0.9 约等于 ΔE<=10；1 表示只合并 hex 全等")
     pair_color_similarity: float = Field(
         0.8, ge=0, le=1, description="眼/眉桶的合并阈值，更松，左右眼、左右眉更容易并成一组")
+    stage_color_similarity: dict[str, Annotated[float, Field(ge=0, le=1)]] | None = Field(
+        None,
+        description="按细类或阶段覆盖合并阈值，如 {'hair':0.85,'background':0.8,'glasses':0.95}；"
+                    "查找顺序：细类（eyes/eyebrows/glasses/hat…）→ 阶段（face/hair/decor/apparel/body/other/background）"
+                    "→ 眼/眉用 pair_color_similarity，其余用 color_similarity")
     merge_gap_ratio: float = Field(
         0.02, ge=0, le=1,
         description="身体/穿戴/其它/背景：两组包围盒最近距离 <= 此比例×图对角线才允许合并；0 关闭空间约束")
@@ -119,6 +124,7 @@ class SemanticOrderRequest(BaseModel):
 class SemanticOrderGroupOut(BaseModel):
     prompt: str | None = None
     label: str | None = None
+    color_similarity: float | None = None
     id: int | str | None = None
     delegate_color: str = ""
     section_list: list[dict]
@@ -265,6 +271,15 @@ def _assign(sec: _Sec, unions: dict[str, np.ndarray], mask_areas: dict[str, int]
         if cov > 0 and cov >= coverage_ratio:
             return stage, prompt, cov
     return "other", "other", 0.0
+
+
+def _similarity_for(req: SemanticOrderRequest, stage: str, label: str) -> float:
+    overrides = req.stage_color_similarity or {}
+    if label in overrides:
+        return overrides[label]
+    if stage in overrides:
+        return overrides[stage]
+    return req.pair_color_similarity if label in PAIR_BUCKETS else req.color_similarity
 
 
 def _bucket_of(stage: str, prompt: str) -> str:
@@ -566,7 +581,7 @@ def build_router(get_model: Callable[[], object]) -> APIRouter:
             pair = label in PAIR_BUCKETS
             by_stage[stage].extend(_merge_bucket(
                 secs, stage, label,
-                min_similarity=req.pair_color_similarity if pair else req.color_similarity,
+                min_similarity=_similarity_for(req, stage, label),
                 gap_px=req.merge_gap_ratio * diag if stage in SPATIAL_MERGE_STAGES else 0,
                 large_area_px=large_area_px,
                 block_impure=not pair,
@@ -607,7 +622,8 @@ def build_router(get_model: Callable[[], object]) -> APIRouter:
         for g in ordered_all:
             g.members.sort(key=lambda s: s.area, reverse=True)
             results.append(SemanticOrderGroupOut(
-                prompt=g.stage, label=g.label, delegate_color=g.color,
+                prompt=g.stage, label=g.label, color_similarity=_similarity_for(req, g.stage, g.label),
+                delegate_color=g.color,
                 section_list=[s.item for s in g.members]))
 
         elapsed_ms = int((time.time() - start) * 1000)
