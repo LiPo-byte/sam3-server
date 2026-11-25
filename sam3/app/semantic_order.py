@@ -1,4 +1,4 @@
-"""语义排序：头部（脸 → 头发 → 头部装饰）→ 身体（皮肤/其余装饰/穿戴从上到下）→ 其它 → 背景。
+"""语义排序：头部（脸 → 眼镜/耳环 → 头发 → 其余头部装饰）→ 身体（皮肤/其余装饰/穿戴从上到下）→ 其它 → 背景。
 
 - 语义不同的区块即使同色也不进一组；身体（颈/肩/手臂…）先归一个桶，再按颜色弱合并
 - 身体/穿戴/其它/背景合并时要求空间相邻，避免一组散在图的两头
@@ -38,9 +38,11 @@ DEFAULT_STAGE_PROMPTS = {
     "background": ["background"],
 }
 ASSIGN_ORDER = ["decor", "face", "hair", "apparel", "body", "background"]
-# 排序：头部（脸 → 头发 → 头部装饰）→ 身体（皮肤/其余装饰/穿戴混排，水平条带从上往下）→ other → background
+# 排序：头部（脸 → 眼镜/耳环 → 头发 → 其余头部装饰）→ 身体（皮肤/其余装饰/穿戴混排，水平条带从上往下）→ other → background
 # 没识别到脸时，按细类判断哪些装饰属于头部
 HEAD_DECOR_LABELS = frozenset({"hat", "headband", "glasses", "earring"})
+# 头部装饰里贴着脸的，排在头发前面；帽子、发箍等仍排在头发后面
+FACE_DECOR_LABELS = frozenset({"glasses", "earring"})
 PERSON_STAGES = frozenset({"face", "hair", "decor", "body", "apparel"})
 # 这些阶段绕人物中心按扇区顺/逆时针推进，扇区内再就近接力
 SWEEP_STAGES = ("other", "background")
@@ -574,7 +576,9 @@ def build_router(get_model: Callable[[], object]) -> APIRouter:
         tol_px = req.order_tolerance_ratio * diag
         ordered_all: list[_Group] = []
         head_decor, body_decor = _split_head_decor(by_stage["decor"], by_stage["face"])
-        for groups in (by_stage["face"], by_stage["hair"], head_decor):
+        face_decor = [g for g in head_decor if g.label in FACE_DECOR_LABELS]
+        hair_decor = [g for g in head_decor if g.label not in FACE_DECOR_LABELS]
+        for groups in (by_stage["face"], face_decor, by_stage["hair"], hair_decor):
             ordered = _order_stage(groups, tail, tol_px)
             ordered_all.extend(ordered)
             if ordered:
