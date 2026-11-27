@@ -23,6 +23,7 @@ from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict, Field
 
 from .color import _delta_e2000, _region_color_stats, _rgb_to_lab, _to_hex
+from .svg_path import mask_to_svg_path
 from .svg_raster import rasterize_path
 
 logger = logging.getLogger("sam3")
@@ -122,6 +123,17 @@ class SemanticOrderRequest(BaseModel):
     max_sections_per_group: int | None = Field(
         None, ge=1,
         description="每组 section 数上限，所有阶段统一；相近色合并不会超过它，hex 全等的超出时按空间就近拆成几组（同色，各自参与排序）；不传不限制")
+    return_masks: bool = Field(
+        False, description="True 时在 masks 里返回每个 prompt 的模型分割结果（每个实例一条 SVG 路径，同 /segment），用于排查归类")
+    mask_simplify: float = Field(1.0, ge=0, description="return_masks 用：approxPolyDP epsilon 像素，0 不简化")
+    mask_min_area: float = Field(16, ge=0, description="return_masks 用：丢弃面积小于此值的轮廓")
+
+
+class SemanticOrderMask(BaseModel):
+    prompt: str
+    score: float
+    box: list[float]
+    path: str
 
 
 class SemanticOrderGroupOut(BaseModel):
@@ -138,6 +150,7 @@ class SemanticOrderResponse(BaseModel):
     height: int
     elapsed_ms: int
     results: list[SemanticOrderGroupOut]
+    masks: list[SemanticOrderMask] | None = None
 
 
 @dataclass
@@ -585,10 +598,16 @@ def build_router(get_model: Callable[[], object]) -> APIRouter:
         prompts = list(dict.fromkeys(p for _, p in specific + tiers))
 
         unions: dict[str, np.ndarray] = {}
-        for prompt, _score, _box, mask in get_model().segment(
+        masks_out: list[SemanticOrderMask] | None = [] if req.return_masks else None
+        for prompt, score, box, mask in get_model().segment(
                 image, prompts, req.threshold, req.mask_threshold):
             m = mask > 0
             unions[prompt] = unions[prompt] | m if prompt in unions else m
+            if masks_out is not None:
+                path = mask_to_svg_path(mask, simplify=req.mask_simplify, min_area=req.mask_min_area)
+                if path:
+                    masks_out.append(SemanticOrderMask(
+                        prompt=prompt, score=round(score, 4), box=[round(v, 1) for v in box], path=path))
         mask_areas = {p: int(m.sum()) for p, m in unions.items()}
 
         assigned: list[tuple[_Sec, str, str]] = []
@@ -600,12 +619,6 @@ def build_router(get_model: Callable[[], object]) -> APIRouter:
                 sec.item["stage"] = stage
                 sec.item["semantic"] = prompt
                 sec.item["coverage"] = round(cov, 3)
-                if stage == "other":
-                    covs = {p: _coverage(sec, m) for p, m in unions.items()}
-                    best = max(covs, key=covs.get, default=None)
-                    sec.item["best_prompt"] = best
-                    sec.item["best_coverage"] = round(covs[best], 3) if best else 0.0
-                    sec.item["person_coverage"] = round(covs.get("person", 0.0), 3)
                 assigned.append((sec, stage, prompt))
         n_sections = len(assigned)
 
@@ -674,6 +687,7 @@ def build_router(get_model: Callable[[], object]) -> APIRouter:
         elapsed_ms = int((time.time() - start) * 1000)
         logger.info("segment_semantic_order %dx%d sections=%d groups=%d %dms",
                     width, height, n_sections, len(results), elapsed_ms)
-        return SemanticOrderResponse(width=width, height=height, elapsed_ms=elapsed_ms, results=results)
+        return SemanticOrderResponse(width=width, height=height, elapsed_ms=elapsed_ms, results=results,
+                                     masks=masks_out)
 
     return router
