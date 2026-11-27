@@ -600,6 +600,12 @@ def build_router(get_model: Callable[[], object]) -> APIRouter:
                 sec.item["stage"] = stage
                 sec.item["semantic"] = prompt
                 sec.item["coverage"] = round(cov, 3)
+                if stage == "other":
+                    covs = {p: _coverage(sec, m) for p, m in unions.items()}
+                    best = max(covs, key=covs.get, default=None)
+                    sec.item["best_prompt"] = best
+                    sec.item["best_coverage"] = round(covs[best], 3) if best else 0.0
+                    sec.item["person_coverage"] = round(covs.get("person", 0.0), 3)
                 assigned.append((sec, stage, prompt))
         n_sections = len(assigned)
 
