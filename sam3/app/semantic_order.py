@@ -119,6 +119,9 @@ class SemanticOrderRequest(BaseModel):
     sweep_joint: bool = Field(
         False,
         description="False：other 先转完一圈，background 再转一圈；True：每个扇区内先 other 再 background，一圈转完两者")
+    max_sections_per_group: int | None = Field(
+        None, ge=1,
+        description="每组 section 数上限，所有阶段统一；相近色合并不会超过它，hex 全等的超出时按空间就近拆成几组（同色，各自参与排序）；不传不限制")
 
 
 class SemanticOrderGroupOut(BaseModel):
@@ -326,6 +329,30 @@ def _connected(members: list[_Sec], gap_px: float) -> list[list[_Sec]]:
     return list(comps.values())
 
 
+def _split_spatial(members: list[_Sec], max_n: int) -> list[list[_Sec]]:
+    """超过 max_n 时均分成 ceil(n/max_n) 块：从最靠上的区块起步，每次吸收离当前块最近的区块，攒满一块再开下一块。"""
+    if max_n <= 0 or len(members) <= max_n:
+        return [members]
+    k = math.ceil(len(members) / max_n)
+    size = math.ceil(len(members) / k)
+    boxes = np.stack([s.box for s in members])
+    gap = _box_gap(boxes, boxes)
+    remaining = set(range(len(members)))
+    chunks: list[list[_Sec]] = []
+    while remaining:
+        seed = min(remaining, key=lambda i: (boxes[i, 1], boxes[i, 0]))
+        chunk = [seed]
+        remaining.discard(seed)
+        dist = gap[seed].copy()
+        while remaining and len(chunk) < size:
+            nxt = min(remaining, key=lambda i: dist[i])
+            chunk.append(nxt)
+            remaining.discard(nxt)
+            dist = np.minimum(dist, gap[nxt])
+        chunks.append([members[i] for i in chunk])
+    return chunks
+
+
 def _hex_to_lab(color: str) -> np.ndarray | None:
     c = (color or "").strip().lstrip("#")
     if len(c) != 6:
@@ -339,15 +366,21 @@ def _hex_to_lab(color: str) -> np.ndarray | None:
 
 def _merge_bucket(secs: list[_Sec], stage: str, label: str, *,
                   min_similarity: float, gap_px: float,
-                  large_area_px: float, block_impure: bool, sector: int = -1) -> list[_Group]:
-    """hex 全等先成组（有空间约束时按相邻拆成连通块），再贪心合并相近色，保留面积大那组的颜色。"""
+                  large_area_px: float, block_impure: bool, sector: int = -1,
+                  max_sections: int = 0) -> list[_Group]:
+    """hex 全等先成组（有空间约束时按相邻拆成连通块），再贪心合并相近色，保留面积大那组的颜色。
+
+    max_sections > 0 时每组 section 数不超过它：hex 全等的组超出就按空间拆块，相近色合并超出就不合并。
+    """
     by_hex: dict[str, list[_Sec]] = defaultdict(list)
     for s in secs:
         by_hex[s.color].append(s)
     groups: list[_Group] = []
     for color, members in by_hex.items():
         comps = _connected(members, gap_px) if gap_px > 0 and len(members) > 1 else [members]
-        groups.extend(_Group(stage, label, color, comp, sector) for comp in comps)
+        for comp in comps:
+            groups.extend(_Group(stage, label, color, chunk, sector)
+                          for chunk in _split_spatial(comp, max_sections))
 
     n = len(groups)
     if min_similarity >= 1 or n < 2:
@@ -367,6 +400,7 @@ def _merge_bucket(secs: list[_Sec], stage: str, label: str, *,
     gap = _group_gap_matrix(groups) if gap_px > 0 else None
     area = np.array([g.area for g in groups], np.float64)
     impure = np.array([any(s.impure for s in g.members) for g in groups])
+    count = np.array([len(g.members) for g in groups])
     alive = np.ones(n, bool)
 
     while True:
@@ -378,7 +412,10 @@ def _merge_bucket(secs: list[_Sec], stage: str, label: str, *,
         s_ij = masked[i, j]
         if not np.isfinite(s_ij) or s_ij < min_similarity:
             break
-        # 面积只增不减、不纯只会传染，这两类阻断可以永久生效
+        # 面积/数量只增不减、不纯只会传染，这几类阻断可以永久生效；数量上限对 hex 全等（拆出来的同色块）也生效
+        if max_sections > 0 and count[i] + count[j] > max_sections:
+            sim[i, j] = sim[j, i] = -np.inf
+            continue
         if s_ij < 1 and large_area_px > 0 and area[i] >= large_area_px and area[j] >= large_area_px:
             sim[i, j] = sim[j, i] = -np.inf
             continue
@@ -389,6 +426,7 @@ def _merge_bucket(secs: list[_Sec], stage: str, label: str, *,
             i, j = j, i
         groups[i].members.extend(groups[j].members)
         area[i] += area[j]
+        count[i] += count[j]
         impure[i] |= impure[j]
         alive[j] = False
         if gap is not None:
@@ -585,7 +623,8 @@ def build_router(get_model: Callable[[], object]) -> APIRouter:
                 gap_px=req.merge_gap_ratio * diag if stage in SPATIAL_MERGE_STAGES else 0,
                 large_area_px=large_area_px,
                 block_impure=not pair,
-                sector=sector))
+                sector=sector,
+                max_sections=req.max_sections_per_group or 0))
 
         tail = None
         tol_px = req.order_tolerance_ratio * diag
