@@ -101,8 +101,8 @@ def detect(req: DetectRequest):
         corners.append(CornerResult(
             corner=name,
             box=list(box),
-            # 有水印且命中分数需大于0.6才算命中，否则不算命中
-            watermarked=bool(label) and score > 0.6,
+            # 有水印且命中分数需大于0.65才算命中，否则不算命中
+            watermarked=bool(label) and score > 0.65,
             label=label,
             score=score,
         ))
