@@ -123,10 +123,12 @@ class SemanticOrderRequest(BaseModel):
     max_sections_per_group: int | None = Field(
         None, ge=1,
         description="每组 section 数上限，所有阶段统一；相近色合并不会超过它，hex 全等的超出时按空间就近拆成几组（同色，各自参与排序）；不传不限制")
-    return_masks: bool = Field(
-        False, description="True 时在 masks 里返回每个 prompt 的模型分割结果（每个实例一条 SVG 路径，同 /segment），用于排查归类")
-    mask_simplify: float = Field(1.0, ge=0, description="return_masks 用：approxPolyDP epsilon 像素，0 不简化")
-    mask_min_area: float = Field(16, ge=0, description="return_masks 用：丢弃面积小于此值的轮廓")
+    debug: bool = Field(
+        False,
+        description="False：section 原样返回，组只有 id/delegate_color/section_list；"
+                    "True：section 附带取色/归类字段，组附带 prompt/label/color_similarity，并在 masks 里返回各 prompt 的分割路径")
+    mask_simplify: float = Field(1.0, ge=0, description="debug 用：masks 路径 approxPolyDP epsilon 像素，0 不简化")
+    mask_min_area: float = Field(16, ge=0, description="debug 用：masks 丢弃面积小于此值的轮廓")
 
 
 class SemanticOrderMask(BaseModel):
@@ -162,6 +164,8 @@ class _Sec:
     box: np.ndarray
     xy: tuple[float, float] | None
     crop: tuple[int, int, np.ndarray] | None
+    # 请求里传入的原样 section，非 debug 时返回它
+    raw: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -239,7 +243,8 @@ def _prepare_section(image: np.ndarray, section: SemanticOrderSection,
     item["dominant_ratio"] = round(dominant_ratio, 3)
     item["peak_delta_e"] = round(peak_delta_e, 1)
     item["color_impure"] = impure
-    return _Sec(item=item, color=color, area=area, impure=impure, box=box, xy=xy, crop=crop)
+    return _Sec(item=item, color=color, area=area, impure=impure, box=box, xy=xy, crop=crop,
+                raw=section.model_dump(exclude_unset=True))
 
 
 def _coverage(sec: _Sec, mask: np.ndarray) -> float:
@@ -579,7 +584,8 @@ def _order_sweep(stage_groups: list[list[_Group]], tail: _Group | None, tol_px: 
 def build_router(get_model: Callable[[], object]) -> APIRouter:
     router = APIRouter()
 
-    @router.post("/segment_semantic_order", response_model=SemanticOrderResponse)
+    # exclude_unset：非 debug 时不显式赋值的 prompt/label/color_similarity/masks 不出现在响应里
+    @router.post("/segment_semantic_order", response_model=SemanticOrderResponse, response_model_exclude_unset=True)
     def segment_semantic_order(req: SemanticOrderRequest):
         image = _decode_image(req.image)
         start = time.time()
@@ -598,7 +604,7 @@ def build_router(get_model: Callable[[], object]) -> APIRouter:
         prompts = list(dict.fromkeys(p for _, p in specific + tiers))
 
         unions: dict[str, np.ndarray] = {}
-        masks_out: list[SemanticOrderMask] | None = [] if req.return_masks else None
+        masks_out: list[SemanticOrderMask] | None = [] if req.debug else None
         for prompt, score, box, mask in get_model().segment(
                 image, prompts, req.threshold, req.mask_threshold):
             m = mask > 0
@@ -679,15 +685,21 @@ def build_router(get_model: Callable[[], object]) -> APIRouter:
         results = [SemanticOrderGroupOut(id=req.group_list[0].id, delegate_color="", section_list=[])]
         for g in ordered_all:
             g.members.sort(key=lambda s: s.area, reverse=True)
-            results.append(SemanticOrderGroupOut(
-                prompt=g.stage, label=g.label, color_similarity=_similarity_for(req, g.stage, g.label),
-                delegate_color=g.color,
-                section_list=[s.item for s in g.members]))
+            if req.debug:
+                results.append(SemanticOrderGroupOut(
+                    prompt=g.stage, label=g.label, color_similarity=_similarity_for(req, g.stage, g.label),
+                    id=None, delegate_color=g.color,
+                    section_list=[s.item for s in g.members]))
+            else:
+                results.append(SemanticOrderGroupOut(
+                    id=None, delegate_color=g.color, section_list=[s.raw for s in g.members]))
 
         elapsed_ms = int((time.time() - start) * 1000)
         logger.info("segment_semantic_order %dx%d sections=%d groups=%d %dms",
                     width, height, n_sections, len(results), elapsed_ms)
-        return SemanticOrderResponse(width=width, height=height, elapsed_ms=elapsed_ms, results=results,
-                                     masks=masks_out)
+        if req.debug:
+            return SemanticOrderResponse(width=width, height=height, elapsed_ms=elapsed_ms, results=results,
+                                         masks=masks_out)
+        return SemanticOrderResponse(width=width, height=height, elapsed_ms=elapsed_ms, results=results)
 
     return router
